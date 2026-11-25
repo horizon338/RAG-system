@@ -199,3 +199,57 @@ RAG问答系统/
 - ✅ 支持文档上传 → 自动向量化 → 知识库问答 完整闭环
 - ✅ 回答附带引用来源，可追溯
 - ✅ 配置文件可切换 LLM 后端 (DeepSeek/Ollama 等)
+
+---
+
+## 十、实施状态（2026-11 更新）
+
+> 实施后的事实记录。与计划不同之处以本章节为准。
+
+### 10.1 阶段完成度
+
+| 阶段 | 计划项 | 实际状态 | 备注 |
+|---|---|---|---|
+| 阶段一 | 1–8 | ✅ 全部完成 | LangChain 改为自实现，见下文 |
+| 阶段一 | 9–10 路由 + 入口 | ✅ 完成 | SSE 流式，路由延迟注册 |
+| 阶段二 | 11–16 前端 | ✅ 完成 | 多文件上传、多轮对话、三段式滚动 |
+| 阶段三 | 17–19 测试与优化 | ✅ 已做端到端验证 | 详情见下文 |
+
+### 10.2 与计划的关键偏离
+
+| 计划点 | 实际做法 | 原因 |
+|---|---|---|
+| **RAG 编排用 LangChain** | 自实现 `text_splitter.py` + `Document` dataclass | LangChain 依赖重、API 变化快。自实现 150 行代码覆盖递归分块，零三方锁定 |
+| **Embedding 默认 bge-m3 (~2GB)** | 默认 `_FallbackEmbedder`（384 维 n-gram 哈希），HF 路线可选 | 首次运行强制下载大模型拖慢启动。Embedding 接口做成可切换，用户 `TRY_HF=True` 即可启用 bge-small-zh-v1.5 |
+| **LLM 默认 Ollama 本地** | 默认 `MockLLM`，未配置 Key 自动降级 | 单机演示目标，Ollama 额外安装负担。Mock 可完整走通 UI 流程 |
+| **删除单文档** | ✨ 新增 | FAISS 无原生删除，`remove_by_source()` 重建索引实现，前端加删除按钮 |
+| **多轮对话** | ✨ 新增 | `rag_pipeline._build_messages()` 注入 history，自动截断到 6 条 |
+| **前端滚动布局** | ✨ 修复 | `el-card__body` + `el-col` 默认不传递 flex 高度，`:deep(.el-card__body)` 强制 flex 三段式 |
+
+### 10.3 新增 API（超计划）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| DELETE | `/api/documents/remove/{filename}` | 删除单个文档 |
+| POST | `/api/chat/ask` + `history` 参数 | 多轮历史传递 |
+| POST | `/api/chat/stream` + `history` 参数 | 流式多轮 |
+| GET | `/api/documents/stats` + `source_chunks` 字段 | 按文档分块数统计 |
+
+### 10.4 已知限制
+
+1. **Fallback Embedding 质量有限**：n-gram 哈希不是语义向量，检索质量与真实模型差距明显。生产必须启用 HF 路线
+2. **FAISS IndexFlatIP**：线性扫描，百万级前够用；再大换 IndexIDMap + IVF
+3. **无混合检索**：当前只做向量相似度，对编号/人名等关键词精确匹配召回弱
+4. **无 OCR**：扫描版 PDF 解析不出文字
+5. **无测试用例**：缺 pytest 自动化测试
+
+---
+
+## 十一、可优化方向（速览）
+
+> 完整清单见项目根目录 README.md "可优化发展方向" 章节。
+
+- **P0 低成本**：启用真实 Embedding、SSE 断点续传、参数调优
+- **P1 中等**：BM25 + 向量混合检索、Cross-Encoder 重排、查询改写、异步上传进度条、集合隔离
+- **P2 结构性**：换向量库、Embedding 预编译、OCR、Agent 化 RAG、评估体系
+- **P3 工程化**：Docker Compose、监控、配额管理、数据备份、测试用例
