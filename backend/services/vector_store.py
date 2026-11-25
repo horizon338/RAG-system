@@ -66,6 +66,41 @@ class VectorStore:
         if self.meta_path.exists():
             self.meta_path.unlink()
 
+    def remove_by_source(self, source: str) -> int:
+        """删除指定来源的所有文档分块，返回删除数量"""
+        if not self.documents or self.index is None:
+            return 0
+
+        # 找出要保留的索引
+        keep_indices = [
+            i for i, d in enumerate(self.documents)
+            if d.metadata.get("source") != source
+        ]
+        removed = len(self.documents) - len(keep_indices)
+        if removed == 0:
+            return 0
+
+        # 重建索引 —— FAISS 没有原生删除，只能重建
+        new_docs = [self.documents[i] for i in keep_indices]
+        if not new_docs:
+            # 删光了 → reset
+            self.reset()
+            return removed
+
+        texts = [d.page_content for d in new_docs]
+        vectors = np.array(get_embeddings(texts), dtype=np.float32)
+        faiss.normalize_L2(vectors)
+        dim = vectors.shape[1]
+
+        self.index = faiss.IndexFlatIP(dim)
+        self.index.add(vectors)
+
+        for i, doc in enumerate(new_docs):
+            doc.metadata["chunk_index"] = i
+        self.documents = new_docs
+        self.save()
+        return removed
+
     # ---------- 索引操作 ----------
     def add_documents(self, docs: List[Document]) -> int:
         """向索引添加文档分块，返回本次添加的数量"""

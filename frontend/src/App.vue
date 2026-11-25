@@ -26,12 +26,17 @@
       <el-row :gutter="20">
         <!-- 左侧: 知识库管理 -->
         <el-col :span="8" class="side-col">
-          <DocUpload :stats="stats" @refresh="fetchStats" @after-upload="fetchStats" />
+          <DocUpload
+            :stats="stats"
+            :source-chunks="sourceChunks"
+            @refresh="fetchStats"
+            @after-upload="fetchStats"
+          />
         </el-col>
 
         <!-- 右侧: 对话 -->
         <el-col :span="16" class="chat-col">
-          <ChatPanel :sources="lastSources" />
+          <ChatPanel />
         </el-col>
       </el-row>
     </el-main>
@@ -39,30 +44,35 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ref, onMounted, onUnmounted } from 'vue'
 import DocUpload from './components/DocUpload.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import { getStats } from './api'
 
 const stats = ref({ documents: 0, chunks: 0, ready: false, sources: [] })
-const lastSources = ref([])
+const sourceChunks = ref({})
+
+let pollTimer = null
 
 const fetchStats = async () => {
   try {
     const { data } = await getStats()
     stats.value = data.stats
+    sourceChunks.value = data.source_chunks || {}
   } catch (e) {
     // 后端未启动时静默
   }
 }
 
-// 暴露给子组件 (通过 provide 或 props 传递 sources 暂用简单事件)
-window.addEventListener('rag-sources', (e) => {
-  lastSources.value = e.detail || []
+onMounted(() => {
+  fetchStats()
+  // 每 10 秒轮询一次状态（用户清空/重建后自动刷新）
+  pollTimer = setInterval(fetchStats, 10000)
 })
 
-onMounted(fetchStats)
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
+})
 </script>
 
 <style scoped>
@@ -97,6 +107,17 @@ onMounted(fetchStats)
   padding: 20px;
   height: calc(100vh - 60px);
   overflow: hidden;
+}
+/* 让 el-row / el-col 也参与高度传递，否则里面的 el-card 拿不到 height:100% */
+.app-main :deep(.el-row) {
+  height: 100%;
+  display: flex;
+}
+.app-main :deep(.el-col) {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .side-col {
   height: 100%;

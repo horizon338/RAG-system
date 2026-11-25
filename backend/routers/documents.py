@@ -28,10 +28,22 @@ def _get_pipeline():
 def get_stats():
     """获取知识库统计信息"""
     pipeline = _get_pipeline()
+    store = pipeline.store
+
+    # 按 source 统计分块数
+    source_chunks: dict[str, int] = {}
+    for d in store.documents:
+        src = d.metadata.get("source", "未知")
+        source_chunks[src] = source_chunks.get(src, 0) + 1
+
+    uploaded_files = sorted([f.name for f in UPLOAD_DIR.iterdir() if f.is_file()])
+    stats = store.get_stats()
+
     return {
         "message": "ok",
-        "stats": pipeline.store.get_stats(),
-        "uploaded_files": sorted([f.name for f in UPLOAD_DIR.iterdir() if f.is_file()]),
+        "stats": stats,
+        "uploaded_files": uploaded_files,
+        "source_chunks": source_chunks,
     }
 
 
@@ -76,3 +88,24 @@ def reset_knowledge():
         if f.is_file():
             f.unlink()
     return {"message": "知识库已清空", "stats": pipeline.store.get_stats()}
+
+
+@router.delete("/remove/{filename:path}")
+def remove_document(filename: str):
+    """删除单个文档（从索引和上传目录中移除）"""
+    pipeline = _get_pipeline()
+    removed = pipeline.store.remove_by_source(filename)
+
+    # 删除上传的原文件
+    file_path = UPLOAD_DIR / filename
+    file_exists = file_path.exists()
+    if file_exists:
+        file_path.unlink()
+
+    return {
+        "message": "ok",
+        "filename": filename,
+        "chunks_removed": removed,
+        "file_deleted": file_exists,
+        "stats": pipeline.store.get_stats(),
+    }

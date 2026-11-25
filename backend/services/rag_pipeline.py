@@ -2,16 +2,18 @@
 RAG 主流程编排
 - build_index(): 上传文档 → 解析 → 分块 → Embedding → FAISS
 - query(): 用户问题 → 检索 → Prompt 组装 → LLM 生成回答
+- 支持多轮对话历史传递
 """
 from pathlib import Path
 from typing import List, Dict, Any, Generator
-
-from langchain_core.documents import Document
 
 from backend.config import settings, UPLOAD_DIR
 from .document_loader import load_and_split_documents
 from .vector_store import VectorStore, get_vector_store
 from .llm import get_llm_client, BaseLLM
+
+# 最多保留的历史消息条数（user + assistant 各算一条）
+MAX_HISTORY_MESSAGES = 6
 
 
 SYSTEM_PROMPT = """你是一个专业的问答助手。请基于提供的【参考资料】来回答用户的问题。
@@ -21,7 +23,20 @@ SYSTEM_PROMPT = """你是一个专业的问答助手。请基于提供的【参�
 2. 如果参考资料中没有足够信息，请明确说明"根据现有知识库无法回答这个问题"
 3. 回答要结构清晰、语言流畅，适合中文阅读
 4. 回答中如有引用参考资料，请在文末标注来源文件名
+5. 可以结合对话上下文理解代词（如"它"、"这个"、"刚才说的"等），但回答仍以当前参考资料为准
 """
+
+
+def _truncate_history(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """保留最近的 N 条消息，避免 token 爆炸"""
+    if not history:
+        return []
+    # 确保最后一条是 user（如果有 assistant 结尾则保留前面的）
+    trimmed = history[-MAX_HISTORY_MESSAGES:]
+    # 如果被截断后第一条是 assistant，丢弃它让 user 开头
+    if trimmed and trimmed[0].get("role") == "assistant":
+        trimmed = trimmed[1:]
+    return trimmed
 
 
 class RAGPipeline:
@@ -64,7 +79,12 @@ class RAGPipeline:
         return result
 
     # ---------- 问答 ----------
-    def _build_messages(self, question: str, context_docs: List[Document]) -> List[Dict[str, str]]:
+    def _build_messages(
+        self,
+        question: str,
+        context_docs: list,
+        history: List[Dict[str, str]] | None = None,
+    ) -> List[Dict[str, str]]:
         context_parts: List[str] = []
         for i, doc in enumerate(context_docs, 1):
             src = doc.metadata.get("source", "未知来源")
@@ -74,18 +94,41 @@ class RAGPipeline:
 
         context_str = "\n\n".join(context_parts)
 
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+        ]
+
+        # 注入历史对话（截断后）
+        if history:
+            messages.extend(_truncate_history(history))
+
+        # 当前用户问题 + 参考资料
         user_content = (
             f"【参考资料】\n{context_str}\n\n"
             f"---\n\n"
             f"【用户问题】\n{question}"
         )
+        messages.append({"role": "user", "content": user_content})
 
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
+        return messages
 
-    def query(self, question: str, top_k: int | None = None) -> Dict[str, Any]:
+    def _collect_sources(self, hits: list) -> List[Dict[str, Any]]:
+        sources = []
+        for doc, score in hits:
+            sources.append({
+                "source": doc.metadata.get("source", "未知"),
+                "page": doc.metadata.get("page"),
+                "score": round(score, 4),
+                "preview": doc.page_content[:150],
+            })
+        return sources
+
+    def query(
+        self,
+        question: str,
+        top_k: int | None = None,
+        history: List[Dict[str, str]] | None = None,
+    ) -> Dict[str, Any]:
         """
         完整 RAG 查询
         返回: {"answer": str, "sources": [...], "retrieved_chunks": int}
@@ -108,25 +151,21 @@ class RAGPipeline:
             }
 
         context_docs = [doc for doc, _ in hits]
-        messages = self._build_messages(question, context_docs)
+        messages = self._build_messages(question, context_docs, history)
         answer = self.llm.chat(messages)
-
-        sources = []
-        for doc, score in hits:
-            sources.append({
-                "source": doc.metadata.get("source", "未知"),
-                "page": doc.metadata.get("page"),
-                "score": round(score, 4),
-                "preview": doc.page_content[:150],
-            })
 
         return {
             "answer": answer,
-            "sources": sources,
+            "sources": self._collect_sources(hits),
             "retrieved_chunks": len(hits),
         }
 
-    def query_stream(self, question: str, top_k: int | None = None) -> Generator[Dict[str, Any], None, None]:
+    def query_stream(
+        self,
+        question: str,
+        top_k: int | None = None,
+        history: List[Dict[str, str]] | None = None,
+    ) -> Generator[Dict[str, Any], None, None]:
         """
         流式 RAG 查询（Yield 字典）
         - 先 yield 检索到的 sources
@@ -142,18 +181,9 @@ class RAGPipeline:
         hits = self.store.search(question, top_k=top_k)
         context_docs = [doc for doc, _ in hits]
 
-        sources = []
-        for doc, score in hits:
-            sources.append({
-                "source": doc.metadata.get("source", "未知"),
-                "page": doc.metadata.get("page"),
-                "score": round(score, 4),
-                "preview": doc.page_content[:150],
-            })
+        yield {"type": "sources", "sources": self._collect_sources(hits)}
 
-        yield {"type": "sources", "sources": sources}
-
-        messages = self._build_messages(question, context_docs)
+        messages = self._build_messages(question, context_docs, history)
         try:
             for delta in self.llm.chat_stream(messages):
                 yield {"type": "token", "content": delta}

@@ -15,8 +15,8 @@
       multiple
       :auto-upload="false"
       :on-change="onChange"
+      :on-remove="onRemove"
       :show-file-list="true"
-      file-list-type="text"
       :file-list="fileList"
       :accept="'.pdf,.txt,.md,.docx'"
     >
@@ -26,7 +26,7 @@
       </div>
       <template #tip>
         <div class="el-upload__tip">
-          支持 PDF / TXT / Markdown / DOCX
+          支持 PDF / TXT / Markdown / DOCX，可一次选择多个文件
         </div>
       </template>
     </el-upload>
@@ -39,7 +39,7 @@
         @click="doUpload"
       >
         <el-icon><CaretRight /></el-icon>
-        {{ uploading ? '正在入库...' : '开始入库' }}
+        {{ uploading ? '正在入库...' : `开始入库 (${fileList.length})` }}
       </el-button>
       <el-button
         :loading="rebuilding"
@@ -58,17 +58,33 @@
       </el-button>
     </div>
 
-    <!-- 已有来源列表 -->
+    <!-- 已有来源列表（可删除） -->
     <div v-if="stats.sources && stats.sources.length" class="sources-list">
-      <div class="label">📂 已入库来源</div>
-      <el-scrollbar height="180px">
+      <div class="label">📂 已入库来源 ({{ stats.sources.length }})</div>
+      <el-scrollbar height="240px">
         <div
           v-for="s in stats.sources"
           :key="s"
           class="source-item"
         >
-          <el-icon><Document /></el-icon>
-          <span>{{ s }}</span>
+          <div class="source-info">
+            <el-icon><Document /></el-icon>
+            <span class="source-name" :title="s">{{ s }}</span>
+            <el-tag size="small" type="info" effect="plain">
+              {{ sourceChunks[s] || 0 }} 块
+            </el-tag>
+          </div>
+          <el-tooltip content="删除此文档">
+            <el-button
+              link
+              type="danger"
+              size="small"
+              :loading="removing === s"
+              @click="doRemove(s)"
+            >
+              <el-icon><Delete /></el-icon>
+            </el-button>
+          </el-tooltip>
         </div>
       </el-scrollbar>
     </div>
@@ -78,28 +94,53 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { uploadFiles, rebuildIndex, resetKnowledge } from '../api'
+import { Delete } from '@element-plus/icons-vue'
+import { uploadFiles, rebuildIndex, resetKnowledge, removeDocument } from '../api'
 
 const props = defineProps({
-  stats: { type: Object, default: () => ({ documents: 0, chunks: 0, ready: false, sources: [] }) },
+  stats: {
+    type: Object,
+    default: () => ({ documents: 0, chunks: 0, ready: false, sources: [] }),
+  },
+  sourceChunks: {
+    type: Object,
+    default: () => ({}),
+  },
 })
 const emit = defineEmits(['refresh', 'after-upload'])
 
-const uploadFilesLocal = ref([]) // 原始 File 对象
+const uploadFilesLocal = ref([]) // 原始 File 对象列表
 const uploading = ref(false)
 const rebuilding = ref(false)
+const removing = ref(null) // 正在删除的 filename
 
 const fileList = computed(() =>
   uploadFilesLocal.value.map((f, i) => ({
     name: f.name,
-    uid: i,
+    uid: f.uid ?? i,
     status: 'ready',
+    raw: f,
   }))
 )
 
-const onChange = (file) => {
-  // 覆盖整个列表为当前选择
-  uploadFilesLocal.value = [file.raw]
+/** el-upload 的 onChange 会在每个文件添加时触发 */
+const onChange = (uploadFile) => {
+  const raw = uploadFile.raw
+  // 避免重复添加（同一 uid 已存在则替换）
+  const idx = uploadFilesLocal.value.findIndex(
+    (f) => f.uid === uploadFile.uid || (f.name === raw.name && f.size === raw.size)
+  )
+  if (idx >= 0) {
+    uploadFilesLocal.value[idx] = raw
+  } else {
+    uploadFilesLocal.value.push(raw)
+  }
+}
+
+const onRemove = (uploadFile) => {
+  uploadFilesLocal.value = uploadFilesLocal.value.filter(
+    (f) => f.uid !== uploadFile.uid && !(f.name === uploadFile.name && f.size === uploadFile.size)
+  )
 }
 
 const doUpload = async () => {
@@ -146,6 +187,26 @@ const doReset = async () => {
     /* 取消 */
   }
 }
+
+const doRemove = async (filename) => {
+  try {
+    await ElMessageBox.confirm(
+      `将从索引中移除 "${filename}"，继续？`,
+      '确认删除',
+      { confirmButtonText: '删除', type: 'warning' }
+    )
+    removing.value = filename
+    const { data } = await removeDocument(filename)
+    ElMessage.success(`已删除，移除 ${data.chunks_removed} 个分块`)
+    emit('refresh')
+  } catch (e) {
+    if (e !== 'cancel') {
+      ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+    }
+  } finally {
+    removing.value = null
+  }
+}
 </script>
 
 <style scoped>
@@ -184,14 +245,28 @@ const doReset = async () => {
 .source-item {
   display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
   padding: 6px 8px;
   font-size: 13px;
   color: #374151;
   border-radius: 6px;
+  gap: 8px;
 }
 .source-item:hover {
   background: #f1f5f9;
+}
+.source-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+.source-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
 }
 .el-icon--upload {
   font-size: 38px;

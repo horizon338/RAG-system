@@ -2,9 +2,10 @@
 问答 API
 - POST /chat/ask       : 同步问答
 - POST /chat/stream    : 流式问答 (SSE)
+支持多轮对话历史传递
 """
 import json
-from typing import Optional
+from typing import Optional, List, Dict
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -13,9 +14,15 @@ from pydantic import BaseModel, Field
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
+class HistoryItem(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str
+
+
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     top_k: Optional[int] = Field(default=None, ge=1, le=10)
+    history: Optional[List[HistoryItem]] = Field(default=None)
 
 
 def _get_pipeline():
@@ -28,7 +35,8 @@ def _get_pipeline():
 def ask(req: AskRequest):
     """同步问答，一次性返回完整回答"""
     pipeline = _get_pipeline()
-    result = pipeline.query(req.question, top_k=req.top_k)
+    history = [h.model_dump() for h in (req.history or [])]
+    result = pipeline.query(req.question, top_k=req.top_k, history=history)
     return result
 
 
@@ -36,9 +44,10 @@ def ask(req: AskRequest):
 def stream_ask(req: AskRequest):
     """流式问答，返回 Server-Sent Events"""
     pipeline = _get_pipeline()
+    history = [h.model_dump() for h in (req.history or [])]
 
     def generate():
-        for chunk in pipeline.query_stream(req.question, top_k=req.top_k):
+        for chunk in pipeline.query_stream(req.question, top_k=req.top_k, history=history):
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 

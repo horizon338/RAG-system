@@ -17,17 +17,19 @@ export const uploadFiles = (files) => {
 export const getStats = () => http.get('/documents/stats')
 export const rebuildIndex = () => http.post('/documents/rebuild')
 export const resetKnowledge = () => http.delete('/documents/reset')
+export const removeDocument = (filename) =>
+  http.delete(`/documents/remove/${encodeURIComponent(filename)}`)
 
 // 问答
-export const ask = (question, topK) =>
-  http.post('/chat/ask', { question, top_k: topK })
+export const ask = (question, topK, history) =>
+  http.post('/chat/ask', { question, top_k: topK, history })
 
-export const askStream = (question, topK, onChunk, onSource, onDone, onError) => {
+export const askStream = (question, topK, history, onChunk, onSource, onDone, onError) => {
   const controller = new AbortController()
   fetch('/api/chat/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, top_k: topK }),
+    body: JSON.stringify({ question, top_k: topK, history }),
     signal: controller.signal,
   })
     .then(async (res) => {

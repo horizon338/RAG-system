@@ -33,7 +33,7 @@
 
       <div
         v-for="(m, i) in messages"
-        :key="i"
+        :key="m.id"
         class="msg"
         :class="m.role"
       >
@@ -102,15 +102,12 @@ import SourceCard from './SourceCard.vue'
 
 marked.setOptions({ breaks: true, gfm: true })
 
-const props = defineProps({
-  sources: { type: Array, default: () => [] },
-})
-
 const listRef = ref(null)
 const question = ref('')
 const messages = ref([])
 const streaming = ref(false)
 let controller = null
+let _idCounter = 0
 
 const quickQs = [
   '这个文档主要讲了什么？',
@@ -131,47 +128,69 @@ const scrollBottom = () => {
   })
 }
 
+/**
+ * 构造给后端的历史消息 —— 只包含已经完成的 user/assistant 对
+ * 不包含当前正在 streaming 的 AI 回复
+ */
+const buildHistory = () => {
+  const history = []
+  for (const m of messages.value) {
+    // 跳过还在 streaming 中的 AI 消息
+    if (m.role === 'user') {
+      history.push({ role: 'user', content: m.content })
+    } else if (m.role === 'ai' && !m.streaming) {
+      history.push({ role: 'assistant', content: m.content })
+    }
+  }
+  return history
+}
+
 const askQuestion = (preset) => {
   const q = preset ?? question.value
   if (!q.trim() || streaming.value) return
 
-  // 追加用户消息
-  messages.value.push({ role: 'user', content: q })
+  // 1. 构造当前对话之前的历史（不含上一条可能未完成的 AI 回复）
+  const history = buildHistory()
+
+  // 2. 追加用户消息
+  const userMsg = { id: ++_idCounter, role: 'user', content: q }
+  messages.value.push(userMsg)
   question.value = ''
   streaming.value = true
 
-  // 追加空的 AI 消息占位
-  const aiIdx = messages.value.length
-  messages.value.push({ role: 'ai', content: '', sources: [], streaming: true })
+  // 3. 追加空的 AI 消息占位
+  const aiMsg = { id: ++_idCounter, role: 'ai', content: '', sources: [], streaming: true }
+  messages.value.push(aiMsg)
   scrollBottom()
 
   let sources = []
   controller = askStream(
     q,
     null,
+    history,
     // onChunk
     (delta) => {
-      messages.value[aiIdx].content += delta
+      aiMsg.content += delta
       scrollBottom()
     },
     // onSource
     (src) => {
       sources = src
-      messages.value[aiIdx].sources = src
+      aiMsg.sources = src
       window.dispatchEvent(new CustomEvent('rag-sources', { detail: src }))
       scrollBottom()
     },
     // onDone
     () => {
-      messages.value[aiIdx].streaming = false
+      aiMsg.streaming = false
       streaming.value = false
       controller = null
       scrollBottom()
     },
     // onError
     (err) => {
-      messages.value[aiIdx].content = `❌ ${err}`
-      messages.value[aiIdx].streaming = false
+      aiMsg.content = `❌ ${err}`
+      aiMsg.streaming = false
       streaming.value = false
       controller = null
       ElMessage.error(String(err))
@@ -204,6 +223,17 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   border-radius: 12px;
+  /* 关键：让 el-card 的 body 包装层正确参与 flex 高度分配 */
+  overflow: hidden;
+}
+/* 穿透 el-card 内部包装，让 body 也参与 flex 列布局 */
+.chat-card :deep(.el-card__body) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
 }
 .card-header {
   display: flex;
@@ -230,7 +260,10 @@ onUnmounted(() => {
   flex: 1;
   overflow-y: auto;
   padding: 12px 4px;
-  min-height: 400px;
+  /* 去掉 min-height，改用 min-height:0 允许 flex 压缩，overflow-y 才会真正生效 */
+  min-height: 0;
+  /* 底部留白，最后一条消息不被输入区遮住 */
+  scroll-padding-bottom: 16px;
 }
 
 .welcome {
