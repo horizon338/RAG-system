@@ -9,6 +9,8 @@ from collections import Counter
 from typing import List
 import numpy as np
 
+from langchain_core.embeddings import Embeddings
+
 from backend.config import settings
 
 _embedding_model = None
@@ -126,3 +128,21 @@ def reload_embedding_model() -> None:
     _embedding_model = None
     _embedding_fallback = False
     _get_model()
+
+
+class LCEmbeddings(Embeddings):
+    """
+    LangChain Embeddings 适配层
+    —— 内部仍复用本项目的模型加载与离线降级逻辑
+    """
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return get_embeddings(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        return embed_query(text)
+
+
+def get_lc_embeddings() -> "LCEmbeddings":
+    """返回可供 LangChain 向量库使用的 Embeddings 实例"""
+    return LCEmbeddings()

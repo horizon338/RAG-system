@@ -1,20 +1,23 @@
 """
-RAG 主流程编排
-- build_index(): 上传文档 → 解析 → 分块 → Embedding → FAISS
-- query(): 用户问题 → 检索 → Prompt 组装 → LLM 生成回答
-- 支持多轮对话历史传递
+RAG 主流程编排 —— 基于 LangChain LCEL
+- 入库：加载 → 切分 → Embedding → FAISS
+- 问答：混合检索 → ChatPromptTemplate → ChatModel → StrOutputParser
+- 支持多轮对话历史（MessagesPlaceholder）
 """
 from pathlib import Path
-from typing import List, Dict, Any, Generator
+from typing import Any, Dict, Generator, List
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from backend.config import settings, UPLOAD_DIR
 from .document_loader import load_and_split_documents
+from .llm import get_chat_model
 from .vector_store import VectorStore, get_vector_store
-from .llm import get_llm_client, BaseLLM
 
-# 最多保留的历史消息条数（user + assistant 各算一条）
+# 历史消息最多保留条数（user + assistant 各算一条）
 MAX_HISTORY_MESSAGES = 6
-
 
 SYSTEM_PROMPT = """你是一个专业的问答助手。请基于提供的【参考资料】来回答用户的问题。
 
@@ -28,30 +31,54 @@ SYSTEM_PROMPT = """你是一个专业的问答助手。请基于提供的【参�
    （注意：检索只取出最相关的若干片段，没被检索到不代表知识库中没有该文档）
 """
 
+HUMAN_TEMPLATE = """{kb_list}【参考资料】
+{context}
+
+---
+
+【用户问题】
+{question}"""
+
 
 def _truncate_history(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """保留最近的 N 条消息，避免 token 爆炸"""
+    """保留最近 N 条历史，避免 token 爆炸"""
     if not history:
         return []
-    # 确保最后一条是 user（如果有 assistant 结尾则保留前面的）
     trimmed = history[-MAX_HISTORY_MESSAGES:]
-    # 如果被截断后第一条是 assistant，丢弃它让 user 开头
     if trimmed and trimmed[0].get("role") == "assistant":
         trimmed = trimmed[1:]
     return trimmed
 
 
+def _to_messages(history: List[Dict[str, str]]) -> List[BaseMessage]:
+    """把前端传来的 history 转成 LangChain 消息对象"""
+    msgs: List[BaseMessage] = []
+    for item in _truncate_history(history):
+        if item.get("role") == "assistant":
+            msgs.append(AIMessage(content=item.get("content", "")))
+        else:
+            msgs.append(HumanMessage(content=item.get("content", "")))
+    return msgs
+
+
 class RAGPipeline:
-    def __init__(self, store: VectorStore | None = None, llm: BaseLLM | None = None):
+    def __init__(self, store: VectorStore | None = None, llm=None):
         self.store = store or get_vector_store()
-        self.llm = llm or get_llm_client()
+        self.llm = llm or get_chat_model()
+
+        # LCEL 链：Prompt → ChatModel → 纯文本输出
+        self.prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", SYSTEM_PROMPT),
+                MessagesPlaceholder("history", optional=True),
+                ("human", HUMAN_TEMPLATE),
+            ]
+        )
+        self.chain = self.prompt | self.llm | StrOutputParser()
 
     # ---------- 索引构建 ----------
     def ingest_files(self, file_paths: List[Path]) -> Dict[str, Any]:
-        """
-        上传并向量化文档
-        返回: 统计信息
-        """
+        """上传并向量化文档"""
         splits = load_and_split_documents(file_paths)
         added = self.store.add_documents(splits)
         return {
@@ -81,60 +108,49 @@ class RAGPipeline:
         return result
 
     # ---------- 问答 ----------
-    def _build_messages(
-        self,
-        question: str,
-        context_docs: list,
-        history: List[Dict[str, str]] | None = None,
-    ) -> List[Dict[str, str]]:
-        context_parts: List[str] = []
+    def _format_context(self, context_docs: list) -> str:
+        parts: List[str] = []
         for i, doc in enumerate(context_docs, 1):
             src = doc.metadata.get("source", "未知来源")
             page = doc.metadata.get("page", "")
             header = f"[资料{i}] {src}" + (f" (第{page}页)" if page else "")
-            context_parts.append(f"{header}\n{doc.page_content}")
+            parts.append(f"{header}\n{doc.page_content}")
+        return "\n\n".join(parts)
 
-        context_str = "\n\n".join(context_parts)
-
-        # 知识库文档清单 —— 让模型知道库里到底有哪些文件
-        kb_list = ""
+    def _kb_list(self) -> str:
+        """知识库文档清单（与检索结果解耦，覆盖全部文档）"""
         stats = self.store.get_stats()
-        if stats.get("sources"):
-            lines = [
-                f"- {name}（{stats['source_chunks'].get(name, 0)} 个片段）"
-                for name in stats["sources"]
-            ]
-            kb_list = "【知识库文档清单】\n" + "\n".join(lines) + "\n\n"
-
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+        if not stats.get("sources"):
+            return ""
+        lines = [
+            f"- {name}（{stats['source_chunks'].get(name, 0)} 个片段）"
+            for name in stats["sources"]
         ]
+        return "【知识库文档清单】\n" + "\n".join(lines) + "\n\n"
 
-        # 注入历史对话（截断后）
-        if history:
-            messages.extend(_truncate_history(history))
-
-        # 当前用户问题 + 参考资料
-        user_content = (
-            f"{kb_list}"
-            f"【参考资料】\n{context_str}\n\n"
-            f"---\n\n"
-            f"【用户问题】\n{question}"
-        )
-        messages.append({"role": "user", "content": user_content})
-
-        return messages
+    def _build_payload(
+        self,
+        question: str,
+        context_docs: list,
+        history: List[Dict[str, str]] | None = None,
+    ) -> Dict[str, Any]:
+        return {
+            "kb_list": self._kb_list(),
+            "context": self._format_context(context_docs),
+            "question": question,
+            "history": _to_messages(history or []),
+        }
 
     def _collect_sources(self, hits: list) -> List[Dict[str, Any]]:
-        sources = []
-        for doc, score in hits:
-            sources.append({
+        return [
+            {
                 "source": doc.metadata.get("source", "未知"),
                 "page": doc.metadata.get("page"),
                 "score": round(score, 4),
                 "preview": doc.page_content[:150],
-            })
-        return sources
+            }
+            for doc, score in hits
+        ]
 
     def query(
         self,
@@ -142,30 +158,22 @@ class RAGPipeline:
         top_k: int | None = None,
         history: List[Dict[str, str]] | None = None,
     ) -> Dict[str, Any]:
-        """
-        完整 RAG 查询
-        返回: {"answer": str, "sources": [...], "retrieved_chunks": int}
-        """
+        """同步 RAG 问答，返回回答 + 引用来源"""
         top_k = top_k or settings.top_k
 
         if not self.store.is_ready:
-            return {
-                "answer": "知识库为空，请先上传文档！",
-                "sources": [],
-                "retrieved_chunks": 0,
-            }
+            return {"answer": "知识库为空，请先上传文档！", "sources": [], "retrieved_chunks": 0}
 
         hits = self.store.search(question, top_k=top_k)
         if not hits:
             return {
-                "answer": "检索失败，请检查 Embedding 模型是否正常加载。",
+                "answer": "检索失败，请检查 Embedding 或索引是否正常。",
                 "sources": [],
                 "retrieved_chunks": 0,
             }
 
-        context_docs = [doc for doc, _ in hits]
-        messages = self._build_messages(question, context_docs, history)
-        answer = self.llm.chat(messages)
+        payload = self._build_payload(question, [d for d, _ in hits], history)
+        answer = self.chain.invoke(payload)
 
         return {
             "answer": answer,
@@ -180,10 +188,7 @@ class RAGPipeline:
         history: List[Dict[str, str]] | None = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
-        流式 RAG 查询（Yield 字典）
-        - 先 yield 检索到的 sources
-        - 再逐步 yield 回答片段
-        - 最后 yield done=True
+        流式 RAG 问答：先推 sources，再由 LCEL 链逐步推 token，最后 done
         """
         top_k = top_k or settings.top_k
 
@@ -192,14 +197,13 @@ class RAGPipeline:
             return
 
         hits = self.store.search(question, top_k=top_k)
-        context_docs = [doc for doc, _ in hits]
-
         yield {"type": "sources", "sources": self._collect_sources(hits)}
 
-        messages = self._build_messages(question, context_docs, history)
+        payload = self._build_payload(question, [d for d, _ in hits], history)
         try:
-            for delta in self.llm.chat_stream(messages):
-                yield {"type": "token", "content": delta}
+            for delta in self.chain.stream(payload):
+                if delta:
+                    yield {"type": "token", "content": delta}
         except Exception as e:
             yield {"type": "error", "content": f"LLM 调用失败: {e}"}
 

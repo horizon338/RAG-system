@@ -219,7 +219,7 @@ RAG问答系统/
 
 | 计划点 | 实际做法 | 原因 |
 |---|---|---|
-| **RAG 编排用 LangChain** | 自实现 `text_splitter.py` + `Document` dataclass | LangChain 依赖重、API 变化快。自实现 150 行代码覆盖递归分块，零三方锁定 |
+| **RAG 编排用 LangChain** | ✅ 已按计划落地：LCEL 链 `ChatPromptTemplate \| ChatModel \| StrOutputParser`，配合官方 `Document` / `RecursiveCharacterTextSplitter` / `FAISS` / `BM25Retriever` | 用官方组件替换早期自实现版本 |
 | **Embedding 默认 bge-m3 (~2GB)** | 默认 `_FallbackEmbedder`（384 维 n-gram 哈希），HF 路线可选 | 首次运行强制下载大模型拖慢启动。Embedding 接口做成可切换，用户 `TRY_HF=True` 即可启用 bge-small-zh-v1.5 |
 | **LLM 默认 Ollama 本地** | 默认 `MockLLM`，未配置 Key 自动降级 | 单机演示目标，Ollama 额外安装负担。Mock 可完整走通 UI 流程 |
 | **删除单文档** | ✨ 新增 | FAISS 无原生删除，`remove_by_source()` 重建索引实现，前端加删除按钮 |
@@ -251,15 +251,25 @@ RAG问答系统/
 
 | 项 | 实现 |
 |---|---|
-| 向量路 | `_vector_ranking()`：FAISS IndexFlatIP，取 `max(top_k*5, 20)` 候选，保留原始余弦相似度 |
-| 关键词路 | `_keyword_ranking()`：纯 Python BM25（k1=1.5, b=0.75），覆盖全部分块 |
+| 向量路 | LangChain FAISS `similarity_search_with_score()`（MAX_INNER_PRODUCT），取 `max(top_k*5, 20)` 候选 |
+| 关键词路 | LangChain `BM25Retriever` + `tokenize()` 中文分词，读取 `vectorizer.get_scores()` |
 | 融合 | `0.4 × 余弦相似度 + 0.6 × (BM25 / 最高BM25)` |
-| 分词 | `_tokenize()`：英文数字串 + 中文单字 + 中文双字 bigram |
+| 分词 | `tokenize()`：英文数字串 + 中文单字 + 中文双字 bigram |
 | 未采用 RRF | RRF(K=60) 会把相邻名次压成 1/61 与 1/62（差 1.6%），Top-4 分数同质化为 0.95~1.0，前端无区分度 |
 
-实测效果：`第三章章节练习有哪些题目？` → docx `0.695` / PDF `0.274`；`构造最小DFA` → docx `0.658` / PDF `0.092`（改造前 docx 未进 Top-4）。
+实测效果：`第三章章节练习有哪些题目？` → docx `0.695` / PDF `0.199`；`构造最小DFA` → docx `0.658` / PDF `0.086`（改造前 docx 未进 Top-4）。
 
-**Prompt 注入**（`backend/services/rag_pipeline.py`）
+**LangChain 编排**（2026-11 迁移）
+
+| 环节 | 组件 |
+|---|---|
+| Prompt | `ChatPromptTemplate` + `MessagesPlaceholder("history", optional=True)` |
+| 链 | LCEL `prompt \| llm \| StrOutputParser`，`RunnableSequence`，支持 `invoke` / `stream` |
+| 模型 | `ChatOpenAI`（OpenAI/DeepSeek）、`ChatOllamaHTTP`（自定义 BaseChatModel 封装 Ollama HTTP）、`MockChatModel` |
+| Embedding | `LCEmbeddings(Embeddings)` 适配层，内部复用降级逻辑 |
+| 分块 | `RecursiveCharacterTextSplitter(separators=[中文标点...], keep_separator=True)` |
+
+**Prompt 注入**
 
 消息顺序：系统指令 → 历史对话（截断至 6 条）→ 用户问题（含知识库清单 + 参考资料）。
 
@@ -268,6 +278,8 @@ RAG问答系统/
 - SYSTEM_PROMPT 第 6 条显式约束：被问"有没有某类文件"时依据清单回答，并说明"没被检索到不代表知识库中没有该文档"
 
 **DOCX 解析增强**：`_load_docx()` 按 `w:p` / `w:tbl` 顺序遍历，提取表格内容并对合并单元格去重；旧实现只读 `doc.paragraphs` 会丢失全部表格。
+
+**已知兼容性问题**：部分中转站模型不支持自定义 `temperature`（返回 400），`ChatOpenAI` 初始化时不传该参数，使用服务端默认值。
 
 ---
 

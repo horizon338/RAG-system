@@ -1,9 +1,10 @@
 """
-FAISS 向量存储封装
-- 使用 IndexFlatIP（内积相似度，配合归一化 embedding → 余弦相似度）
-- 持久化到磁盘，启动时自动加载
+向量存储 —— 基于 LangChain
+- 向量库：langchain_community.vectorstores.FAISS（IndexFlatIP + 余弦相似度）
+- 关键词：langchain_community.retrievers.BM25Retriever（rank_bm25 后端）
+- 混合检索：两路分数加权融合
+- 持久化：FAISS serialize_index + Python 原生 I/O，绕过 Windows 中文路径问题
 """
-import json
 import math
 import pickle
 import re
@@ -13,21 +14,29 @@ from typing import List, Tuple
 
 import faiss
 import numpy as np
+from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_community.retrievers import BM25Retriever
+from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores.utils import DistanceStrategy
+from langchain_core.documents import Document
 
 from backend.config import FAISS_DIR
-from .embedding import get_embeddings, embed_query
-from .text_splitter import Document
+from .embedding import get_embeddings, embed_query, get_lc_embeddings
 
 
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]+")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
+# 向量 / 关键词 权重（默认 Embedding 为降级向量，关键词更可信）
+W_VEC = 0.4
+W_KW = 0.6
 
-def _tokenize(text: str) -> List[str]:
+
+def tokenize(text: str) -> List[str]:
     """
-    轻量分词：
-    - 英文/数字按连续串切分
-    - 中文取单字 + 相邻双字（bigram），兼顾精确与召回
+    BM25 分词函数：
+    - 英文 / 数字按连续串切分
+    - 中文取单字 + 相邻双字（bigram）
     """
     text = text.lower()
     tokens = _WORD_RE.findall(text)
@@ -43,34 +52,60 @@ class VectorStore:
         self.meta_path = (index_path or FAISS_DIR / "index.faiss").with_suffix(".meta.pkl")
         self.index: faiss.IndexFlatIP | None = None
         self.documents: List[Document] = []
+        # LangChain 组件（随 documents 变化重建）
+        self.vectorstore: FAISS | None = None
+        self.bm25: BM25Retriever | None = None
         self._loaded = False
+
+    # ---------- LangChain 组件装配 ----------
+    def _rebuild_retrievers(self) -> None:
+        """根据当前 documents / index 重建 FAISS 与 BM25Retriever"""
+        if self.index is None or not self.documents:
+            self.vectorstore = None
+            self.bm25 = None
+            return
+
+        docstore = InMemoryDocstore(
+            {str(i): d for i, d in enumerate(self.documents)}
+        )
+        index_to_id = {i: str(i) for i in range(len(self.documents))}
+        self.vectorstore = FAISS(
+            embedding_function=get_lc_embeddings(),
+            index=self.index,
+            docstore=docstore,
+            index_to_docstore_id=index_to_id,
+            distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
+        )
+
+        self.bm25 = BM25Retriever.from_documents(
+            self.documents, preprocess_func=tokenize
+        )
+        self.bm25.k = min(len(self.documents), 20)
 
     # ---------- 生命周期 ----------
     def load(self) -> bool:
         """从磁盘加载已有索引；返回是否加载成功"""
         if self.index_path.exists() and self.meta_path.exists():
             try:
-                # 用 Python 原生 I/O 读文件 → 绕过 FAISS C++ 层的中文路径问题
+                # Python 原生 I/O 绕过 FAISS C++ 层的中文路径问题
                 with open(self.index_path, "rb") as f:
                     data = f.read()
-                # serialize_index 产出的是 uint8 ndarray 的缓冲区，反序列化需还原成 ndarray
-                self.index = faiss.deserialize_index(
-                    np.frombuffer(data, dtype=np.uint8)
-                )
+                self.index = faiss.deserialize_index(np.frombuffer(data, dtype=np.uint8))
                 with open(self.meta_path, "rb") as f:
                     self.documents = pickle.load(f)
+                self._rebuild_retrievers()
                 self._loaded = True
                 return True
             except Exception as e:
-                print(f"[WARN] 加载 FAISS 索引失败，将重建: {e}")
+                print(f"[WARN] 加载索引失败，将重建: {e}")
+                self.index = None
+                self.documents = []
         return False
 
     def save(self) -> None:
-        """持久化索引和文档元数据"""
+        """持久化索引与分块元数据"""
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         if self.index is not None:
-            # 先用 FAISS 序列化到内存（bytes），再用 Python 写文件
-            # 这样可以绕过 FAISS C++ 层对中文路径的兼容性问题
             data = faiss.serialize_index(self.index)
             with open(self.index_path, "wb") as f:
                 f.write(data)
@@ -81,6 +116,8 @@ class VectorStore:
         """清空索引"""
         self.index = None
         self.documents = []
+        self.vectorstore = None
+        self.bm25 = None
         self._loaded = False
         if self.index_path.exists():
             self.index_path.unlink()
@@ -88,11 +125,10 @@ class VectorStore:
             self.meta_path.unlink()
 
     def remove_by_source(self, source: str) -> int:
-        """删除指定来源的所有文档分块，返回删除数量"""
+        """删除指定来源的所有分块，返回删除数量"""
         if not self.documents or self.index is None:
             return 0
 
-        # 找出要保留的索引
         keep_indices = [
             i for i, d in enumerate(self.documents)
             if d.metadata.get("source") != source
@@ -101,132 +137,92 @@ class VectorStore:
         if removed == 0:
             return 0
 
-        # 重建索引 —— FAISS 没有原生删除，只能重建
         new_docs = [self.documents[i] for i in keep_indices]
         if not new_docs:
-            # 删光了 → reset
             self.reset()
             return removed
 
-        texts = [d.page_content for d in new_docs]
+        self._index_from_scratch(new_docs)
+        return removed
+
+    def _index_from_scratch(self, docs: List[Document]) -> None:
+        """对给定分块重新向量化并重建索引"""
+        texts = [d.page_content for d in docs]
         vectors = np.array(get_embeddings(texts), dtype=np.float32)
         faiss.normalize_L2(vectors)
-        dim = vectors.shape[1]
 
-        self.index = faiss.IndexFlatIP(dim)
+        self.index = faiss.IndexFlatIP(vectors.shape[1])
         self.index.add(vectors)
 
-        for i, doc in enumerate(new_docs):
+        for i, doc in enumerate(docs):
             doc.metadata["chunk_index"] = i
-        self.documents = new_docs
+        self.documents = docs
+        self._rebuild_retrievers()
         self.save()
-        return removed
 
     # ---------- 索引操作 ----------
     def add_documents(self, docs: List[Document]) -> int:
-        """向索引添加文档分块，返回本次添加的数量"""
+        """向索引追加分块，返回本次添加数量"""
         if not docs:
             return 0
 
         texts = [d.page_content for d in docs]
         vectors = np.array(get_embeddings(texts), dtype=np.float32)
-
-        # 归一化 (保证内积 == 余弦相似度)
         faiss.normalize_L2(vectors)
 
-        dim = vectors.shape[1]
-
         if self.index is None:
-            self.index = faiss.IndexFlatIP(dim)
+            self.index = faiss.IndexFlatIP(vectors.shape[1])
 
         start_idx = len(self.documents)
         self.index.add(vectors)
 
-        # 同步 chunk_index
         for i, doc in enumerate(docs):
             doc.metadata["chunk_index"] = start_idx + i
         self.documents.extend(docs)
 
+        self._rebuild_retrievers()
         self.save()
         return len(docs)
 
     # ---------- 检索 ----------
-    def _vector_ranking(self, query: str, limit: int) -> List[Tuple[int, float]]:
-        """向量检索，返回 [(doc_index, 余弦相似度), ...] 按分数降序"""
-        q_vec = np.array([embed_query(query)], dtype=np.float32)
-        faiss.normalize_L2(q_vec)
-        k = min(limit, len(self.documents))
-        scores, indices = self.index.search(q_vec, k)
-        out: List[Tuple[int, float]] = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0 or idx >= len(self.documents):
-                continue
-            out.append((int(idx), float(score)))
-        return out
-
-    def _keyword_ranking(self, query: str) -> List[Tuple[int, float]]:
-        """
-        BM25 关键词检索
-        —— 兜底 Embedding 质量差时，靠字面匹配把相关分块抬上来
-        """
-        q_tokens = _tokenize(query)
-        if not q_tokens:
-            return []
-
-        doc_tokens = [_tokenize(d.page_content) for d in self.documents]
-        n_docs = len(doc_tokens)
-        avgdl = sum(len(t) for t in doc_tokens) / n_docs or 1.0
-
-        # 文档频率
-        df: Counter = Counter()
-        for tokens in doc_tokens:
-            for t in set(tokens):
-                df[t] += 1
-
-        k1, b = 1.5, 0.75
-        scored: List[Tuple[int, float]] = []
-        for i, tokens in enumerate(doc_tokens):
-            tf = Counter(tokens)
-            s = 0.0
-            for t in q_tokens:
-                if t not in tf:
-                    continue
-                idf = math.log(1 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
-                s += idf * (tf[t] * (k1 + 1)) / (
-                    tf[t] + k1 * (1 - b + b * len(tokens) / avgdl)
-                )
-            if s > 0:
-                scored.append((i, s))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored
-
     def search(self, query: str, top_k: int = 4) -> List[Tuple[Document, float]]:
         """
-        混合检索：向量相似度 + BM25 关键词分数加权融合
-        - 向量：使用真实余弦相似度（不归一化，避免噪声被放大）
-        - 关键词：BM25 按本次查询最高分归一
-        - 权重 向量 0.4 / 关键词 0.6（通用 Embedding 降级时关键词更可靠）
+        混合检索（LangChain FAISS + BM25Retriever）
+        分数 = 0.4 × 余弦相似度 + 0.6 × (BM25 / 本次最高 BM25)
         返回 [(Document, 综合相关度 0~1), ...]
         """
-        if self.index is None or not self.documents:
+        if not self.is_ready or self.vectorstore is None:
             return []
 
-        vec_hits = self._vector_ranking(query, limit=max(top_k * 5, 20))
-        kw_hits = self._keyword_ranking(query)
+        # 1) 向量路：IndexFlatIP 的 score 即内积（越高越相似）
+        n_candidates = min(max(top_k * 5, 20), len(self.documents))
+        vec_pairs = self.vectorstore.similarity_search_with_score(query, k=n_candidates)
 
-        if not vec_hits and not kw_hits:
+        # 用对象身份定位回 self.documents 下标
+        id_to_idx = {id(d): i for i, d in enumerate(self.documents)}
+        vec_scores: dict[int, float] = {}
+        for doc, score in vec_pairs:
+            idx = id_to_idx.get(id(doc))
+            if idx is not None:
+                vec_scores[idx] = max(float(score), 0.0)
+
+        # 2) 关键词路：BM25Okapi 打分
+        kw_scores: dict[int, float] = {}
+        if self.bm25 is not None and getattr(self.bm25, "vectorizer", None) is not None:
+            raw = self.bm25.vectorizer.get_scores(tokenize(query))
+            for i, s in enumerate(raw):
+                if s > 0:
+                    kw_scores[i] = float(s)
+
+        if not vec_scores and not kw_scores:
             return []
 
-        vec_map = {idx: max(cos, 0.0) for idx, cos in vec_hits}
-        kw_map = dict(kw_hits)
-        kw_max = kw_hits[0][1] if kw_hits else 0.0
-
-        W_VEC, W_KW = 0.4, 0.6
+        # 3) 融合
+        kw_max = max(kw_scores.values()) if kw_scores else 0.0
         fused: dict[int, float] = {}
-        for idx in set(vec_map) | set(kw_map):
-            cos = vec_map.get(idx, 0.0)
-            kw = (kw_map.get(idx, 0.0) / kw_max) if kw_max > 0 else 0.0
+        for idx in set(vec_scores) | set(kw_scores):
+            cos = vec_scores.get(idx, 0.0)
+            kw = (kw_scores.get(idx, 0.0) / kw_max) if kw_max > 0 else 0.0
             fused[idx] = W_VEC * cos + W_KW * kw
 
         ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_k]

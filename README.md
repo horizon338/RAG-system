@@ -11,16 +11,48 @@
 | 层级 | 技术 | 说明 |
 |---|---|---|
 | 后端 | Python 3.11+ / FastAPI / Uvicorn | 异步 Web 框架，自动生成 OpenAPI 文档 |
-| 检索 | **混合检索**：FAISS 向量（IndexFlatIP）+ 自实现 BM25 关键词 | 两路加权融合，见「混合检索」章节 |
-| 文本分块 | 自实现递归字符分块（中文标点优先切分） | 不依赖 LangChain |
-| Embedding | 默认字符 n-gram 离线向量；可切换 BAAI/bge-small-zh-v1.5 | `embedding.py` 内置 Fallback，零模型依赖也能跑 |
-| 大模型 | OpenAI 兼容接口 / DeepSeek / Ollama / Mock | HTTP 调用，无本地模型推理 |
+| RAG 编排 | **LangChain（LCEL）** | `ChatPromptTemplate → ChatModel → StrOutputParser` |
+| 检索 | **混合检索**：LangChain FAISS + BM25Retriever | 两路加权融合，见「混合检索」章节 |
+| 文本分块 | LangChain `RecursiveCharacterTextSplitter` | 中文标点优先切分 |
+| Embedding | 默认字符 n-gram 离线向量；可切换 BAAI/bge-small-zh-v1.5 | 通过 `LCEmbeddings` 适配 LangChain 接口 |
+| 大模型 | LangChain `ChatModel`：OpenAI / DeepSeek / Ollama / Mock | `ChatOpenAI` + 自定义 Ollama HTTP 封装 |
 | 文档解析 | pypdf / python-docx / 原生文本读取 | PDF / DOCX / TXT / Markdown；DOCX 支持表格提取 |
-| Prompt | 系统指令 + 知识库文档清单 + 检索片段 + 用户问题 | 见「Prompt 注入机制」章节 |
+| Prompt | `ChatPromptTemplate` + `MessagesPlaceholder` | 系统指令 + 知识库清单 + 检索片段 + 历史对话 |
 | 前端 | Vue 3 + Vite + Element Plus + marked | SPA，流式打字机效果，多文件上传 |
 | 数据存储 | 本地目录 `data/` | 上传文件 + FAISS 索引（serialize 绕过中文路径）+ 分块元数据（pickle） |
 
-> **注意**：本项目不依赖 PyTorch、LangChain 训练/推理代码。Embedding 默认 Fallback 路径无任何三方模型下载；HF 路线（可选）启用时会间接拉起 `sentence-transformers` + torch。
+> **注意**：Dense Embedding 默认走内置 n-gram 降级实现，不需要 PyTorch / model 文件；只有在启用 HuggingFace Embedding 路线时才会间接引入 `sentence-transformers` + torch。
+
+---
+
+## LangChain 编排结构
+
+整个 RAG 流程由 LangChain 的 LCEL 串成一条链，核心组件如下：
+
+| 环节 | LangChain 组件 | 本项目代码 |
+|---|---|---|
+| 文档对象 | `langchain_core.documents.Document` | `text_splitter.py` 直接复用 |
+| 分块 | `RecursiveCharacterTextSplitter` | `text_splitter.get_splitter()` |
+| Embedding | `langchain_core.embeddings.Embeddings` | `embedding.LCEmbeddings` 适配降级逻辑 |
+| 向量库 | `langchain_community.vectorstores.FAISS` | `vector_store.py`（MAX_INNER_PRODUCT） |
+| 关键词检索 | `langchain_community.retrievers.BM25Retriever` | 通过 `tokenize()` 提供中文分词 |
+| Prompt | `ChatPromptTemplate` + `MessagesPlaceholder` | `rag_pipeline.py` |
+| 模型 | `BaseChatModel` / `ChatOpenAI` | `llm.py`（含 Mock 与 Ollama HTTP 实现） |
+| 输出解析 | `StrOutputParser` | 链尾 |
+| 链 | LCEL `prompt \| llm \| parser` | `RAGPipeline.chain`（`RunnableSequence`） |
+
+调用方式：
+
+```python
+# 同步
+answer = pipeline.chain.invoke(payload)
+
+# 流式（SSE 逐 token 推送）
+for delta in pipeline.chain.stream(payload):
+    yield {"type": "token", "content": delta}
+```
+
+多轮对话由 `MessagesPlaceholder("history", optional=True)` 承载，前端传来的 `history` 会转成 `HumanMessage` / `AIMessage` 后注入。
 
 ---
 
@@ -144,8 +176,8 @@ FAISS 的 `write_index/read_index` 在 Windows 中文路径下会报 Permission 
 
 | 阶段 | 方法 | 说明 |
 |---|---|---|
-| 向量召回 | `_vector_ranking()` | FAISS `IndexFlatIP`，取 `max(top_k*5, 20)` 个候选，保留**原始余弦相似度**不做归一 |
-| 关键词召回 | `_keyword_ranking()` | 纯 Python BM25（k1=1.5, b=0.75），对全部分块打分，无新增依赖 |
+| 向量召回 | `vectorstore.similarity_search_with_score()` | LangChain FAISS（IndexFlatIP），取 `max(top_k*5, 20)` 个候选，保留**原始余弦相似度**不做归一 |
+| 关键词召回 | `BM25Retriever.vectorizer.get_scores()` | LangChain BM25Retriever（rank_bm25 后端），通过 `tokenize()` 提供中文分词 |
 | 分数融合 | 加权求和 | `0.4 × 余弦相似度 + 0.6 × (BM25 / 本次最高 BM25)` |
 
 设计取舍：
@@ -154,7 +186,7 @@ FAISS 的 `write_index/read_index` 在 Windows 中文路径下会报 Permission 
 - **向量权重只给 0.4**。默认 Embedding 不可靠时关键词更值得信任；切换到真实 bge 模型后，应把权重调向向量侧（`W_VEC / W_KW` 常量在 `search()` 内）。
 - **余弦相似度保持原值不归一**。若按本次最大值归一，噪声最大的分块也会被抬到 1.0，反而放大错误信号。
 
-分词策略 `_tokenize()`：英文/数字按连续串切分，中文同时取**单字 + 相邻双字（bigram）**，兼顾"最小DFA"这类术语的精确匹配与中文的召回率。
+分词策略 `tokenize()`（`vector_store.py`）：英文/数字按连续串切分，中文同时取**单字 + 相邻双字（bigram）**，兼顾"最小DFA"这类术语的精确匹配与中文的召回率。该函数同时作为 `BM25Retriever(preprocess_func=...)` 的分词器。
 
 效果对比（同一知识库：1 个 PDF 7 块 + 1 个 docx 1 块）：
 
@@ -242,7 +274,7 @@ FAISS `IndexFlatIP` 无原生删除，`vector_store.remove_by_source()` 内部�
 
 | 计划项 | 实际落地 | 原因 |
 |---|---|---|
-| LangChain 编排 | 自实现 `text_splitter` + `Document` | 零依赖更轻，避免三方版本锁死 |
+| LangChain 编排 | ✅ 按原计划落地（LCEL 链 + 官方组件） | 见「LangChain 编排结构」 |
 | bge-m3 Embedding 强制加载 | 默认 FallbackEmbedder，HF 可切换 | 首次运行 2GB+ 下载影响启动 |
 | 纯语义相似度检索 | ✨ 升级为混合检索（向量 + BM25 加权融合） | 降级 Embedding 下纯向量无法区分相关度，会导致"库里有文档却说没有" |
 | Prompt 仅含检索片段 | ✨ 额外注入知识库文档清单 | 让模型能回答"库里有哪些文档/有没有某类文件" |
@@ -307,7 +339,12 @@ openai, httpx
 pypdf, python-docx
 python-dotenv
 
+# LangChain 编排
+langchain>=1.0, langchain-core>=1.0, langchain-community>=0.4
+langchain-openai>=1.0, langchain-text-splitters>=1.0
+rank_bm25>=0.2.2
+
 # Optional（HF Embedding 路线，启用时会间接引入 torch）
-# sentence-transformers>=2.2.0
-# langchain-huggingface>=0.3.0
+# sentence-transformers
+# langchain-huggingface
 ```
