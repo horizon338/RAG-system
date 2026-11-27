@@ -11,11 +11,12 @@
 | 层级 | 技术 | 说明 |
 |---|---|---|
 | 后端 | Python 3.11+ / FastAPI / Uvicorn | 异步 Web 框架，自动生成 OpenAPI 文档 |
-| 向量检索 | FAISS（IndexFlatIP，归一化后内积 = 余弦相似度） | CPU 版本，轻量单机 |
+| 检索 | **混合检索**：FAISS 向量（IndexFlatIP）+ 自实现 BM25 关键词 | 两路加权融合，见「混合检索」章节 |
 | 文本分块 | 自实现递归字符分块（中文标点优先切分） | 不依赖 LangChain |
 | Embedding | 默认字符 n-gram 离线向量；可切换 BAAI/bge-small-zh-v1.5 | `embedding.py` 内置 Fallback，零模型依赖也能跑 |
 | 大模型 | OpenAI 兼容接口 / DeepSeek / Ollama / Mock | HTTP 调用，无本地模型推理 |
-| 文档解析 | pypdf / python-docx / 原生文本读取 | PDF / DOCX / TXT / Markdown |
+| 文档解析 | pypdf / python-docx / 原生文本读取 | PDF / DOCX / TXT / Markdown；DOCX 支持表格提取 |
+| Prompt | 系统指令 + 知识库文档清单 + 检索片段 + 用户问题 | 见「Prompt 注入机制」章节 |
 | 前端 | Vue 3 + Vite + Element Plus + marked | SPA，流式打字机效果，多文件上传 |
 | 数据存储 | 本地目录 `data/` | 上传文件 + FAISS 索引（serialize 绕过中文路径）+ 分块元数据（pickle） |
 
@@ -135,6 +136,75 @@ FAISS 的 `write_index/read_index` 在 Windows 中文路径下会报 Permission 
 - **Embedding**：`TRY_HF = False` 硬编码，默认走 `_FallbackEmbedder`（384 维 n-gram 哈希向量）。若启用 HF，需取消 `requirements.txt` 中的 `sentence-transformers` 和 `langchain-huggingface`。
 - **LLM**：配置缺失时自动降级 `MockLLM`，返回结构化占位回答。界面流程完整可演示。
 
+### 混合检索（向量 + BM25）
+
+纯向量检索在本项目有一个致命短板：默认 Embedding 是 n-gram 哈希降级向量，语义能力接近随机，实测相似度全落在 0.11~0.32，无法区分相关与不相关。文件多的知识库里，某个文档的分块会被完全挤出 Top-K，表现为"库里有这个文件，但 AI 说没有"。
+
+因此 `VectorStore.search()` 改为**两路召回 + 分数融合**：
+
+| 阶段 | 方法 | 说明 |
+|---|---|---|
+| 向量召回 | `_vector_ranking()` | FAISS `IndexFlatIP`，取 `max(top_k*5, 20)` 个候选，保留**原始余弦相似度**不做归一 |
+| 关键词召回 | `_keyword_ranking()` | 纯 Python BM25（k1=1.5, b=0.75），对全部分块打分，无新增依赖 |
+| 分数融合 | 加权求和 | `0.4 × 余弦相似度 + 0.6 × (BM25 / 本次最高 BM25)` |
+
+设计取舍：
+
+- **不做 RRF（倒数排名融合）**。RRF 在 K=60 时把相邻名次压缩到 1/61 与 1/62（相差 1.6%），实测 Top-4 分数全变成 0.95~1.0，前端看不出区分度。改用分数融合后同一问题下相关文档 `0.695` vs 无关文档 `0.274`，差异可读。
+- **向量权重只给 0.4**。默认 Embedding 不可靠时关键词更值得信任；切换到真实 bge 模型后，应把权重调向向量侧（`W_VEC / W_KW` 常量在 `search()` 内）。
+- **余弦相似度保持原值不归一**。若按本次最大值归一，噪声最大的分块也会被抬到 1.0，反而放大错误信号。
+
+分词策略 `_tokenize()`：英文/数字按连续串切分，中文同时取**单字 + 相邻双字（bigram）**，兼顾"最小DFA"这类术语的精确匹配与中文的召回率。
+
+效果对比（同一知识库：1 个 PDF 7 块 + 1 个 docx 1 块）：
+
+| 问题 | 纯向量 | 混合检索 |
+|---|---|---|
+| 第三章章节练习有哪些题目？ | docx 排第 1，但与 PDF 分差极小 | docx `0.695`，PDF `0.274` |
+| 构造最小DFA | docx 未进 Top-4 | docx 排第 1，`0.658` vs `0.092` |
+
+### Prompt 注入机制
+
+`rag_pipeline._build_messages()` 按固定结构拼装消息，顺序为：**系统指令 → 历史对话（可选）→ 当前用户问题（含知识库清单与参考资料）**。
+
+系统提示 `SYSTEM_PROMPT` 的 6 条规则中，第 6 条专门解决"文件在库里却答没有"的问题：
+
+```
+6. 当用户询问"知识库里有哪些文档/有没有某类文件"时，请依据【知识库文档清单】如实回答，不要声称没有
+   （注意：检索只取出最相关的若干片段，没被检索到不代表知识库中没有该文档）
+```
+
+用户消息的实际结构：
+
+```
+【知识库文档清单】          ← 每次请求实时生成，不受 Top-K 限制
+- 《UI与交互设计》课程小组项目选题.pdf（7 个片段）
+- 第三章章节练习.docx（1 个片段）
+
+【参考资料】                ← 混合检索命中的 Top-K 分块
+[资料1] 第三章章节练习.docx
+3-1. 对于下面所给的文法……
+
+[资料2] 《UI与交互设计》课程小组项目选题.pdf (第1页)
+《软件交互设计》课程小组项目选题……
+
+---
+
+【用户问题】
+第三章章节练习有哪些题目？
+```
+
+关键点：
+
+- **文档清单与检索结果解耦**。清单直接来自 `store.get_stats()["source_chunks"]`，覆盖全部文档；参考资料才是 Top-K。这样即便某文档这次没被检索到，模型也不会撒谎说"库里没有"。
+- **清单带片段数**，模型可以据此判断文档体量，回答"有哪些文档"时更准确。
+- **参考资料标注来源文件与页码**，配合系统规则 4，回答末尾可追溯到具体文件。
+- **历史对话插在系统指令之后、参考资料之前**，且经 `_truncate_history()` 截断到最近 6 条，避免长对话把上下文撑爆。
+
+### DOCX 表格提取
+`_load_docx()` 不再只用 `doc.paragraphs`（会漏掉全部表格内容），改为按文档原始顺序遍历 `w:p` / `w:tbl` 两类节点：段落取文本，表格按 `单元格 | 单元格` 拼接并对合并单元格产生的重复文本去重保序。
+
+
 ### 启动速度
 所有服务（vector_store / llm / rag_pipeline）与路由在 `lifespan` 阶段延迟 import，三方库导入不阻塞 ASGI 启动。
 
@@ -174,6 +244,8 @@ FAISS `IndexFlatIP` 无原生删除，`vector_store.remove_by_source()` 内部�
 |---|---|---|
 | LangChain 编排 | 自实现 `text_splitter` + `Document` | 零依赖更轻，避免三方版本锁死 |
 | bge-m3 Embedding 强制加载 | 默认 FallbackEmbedder，HF 可切换 | 首次运行 2GB+ 下载影响启动 |
+| 纯语义相似度检索 | ✨ 升级为混合检索（向量 + BM25 加权融合） | 降级 Embedding 下纯向量无法区分相关度，会导致"库里有文档却说没有" |
+| Prompt 仅含检索片段 | ✨ 额外注入知识库文档清单 | 让模型能回答"库里有哪些文档/有没有某类文件" |
 | 外部部署 / Docker | 无 | 单机演示目标 |
 | 扫描 PDF OCR | 无 | 暂不涉及 |
 | WebSocket 对话 | 采用 SSE `StreamingResponse` | 语义合适，实现更简单 |
@@ -196,8 +268,8 @@ FAISS `IndexFlatIP` 无原生删除，`vector_store.remove_by_source()` 内部�
 
 | 方向 | 说明 | 涉及文件 |
 |---|---|---|
-| **混合检索：向量 + BM25** | 纯向量对关键词精确匹配（如人名、编号）效果差。BM25 做关键词召回，向量做语义召回，合并后重排。Python 库可用 `rank_bm25` | 新模块 `backend/services/bm25_retriever.py`, `vector_store.py`, `rag_pipeline.py` |
-| **Cross-Encoder 重排序（Rerank）** | 对 FAISS Top-K 结果用 bge-reranker-v2-m3 做精排，准确率显著提升。需要 HF，间接需要 torch | `rag_pipeline.py` 新增 rerank 步骤 |
+| ~~**混合检索：向量 + BM25**~~ ✅ **已实现** | 见「混合检索」章节。后续可调优：切换真实 Embedding 后把 `W_VEC` 提到 0.6~0.7；候选集扩大后用 `rank_bm25` 替换自实现版本 | `backend/services/vector_store.py` |
+| **Cross-Encoder 重排序（Rerank）** | 对混合检索的 Top-K 结果用 bge-reranker-v2-m3 做精排，准确率显著提升。需要 HF，间接需要 torch | `rag_pipeline.py` 新增 rerank 步骤 |
 | **查询改写（Query Rewrite）** | 用户的口语化问题（"它难不难？"）先让 LLM 改写为完整语义问题，再去检索。对多轮对话尤其有效 | `rag_pipeline.py` 新增 `rewrite_query()` |
 | **异步上传 + 进度条** | 大 PDF 解析和向量化阻塞请求。改为 Celery/Redis 或 `asyncio` 后台任务，上传即返回 task_id，前端轮询进度 | `routers/documents.py`, 新增 Task 模块 |
 | **按文档 / 知识集合隔离** | 给每个文档（或一组文档）一个 `collection_id`，检索时只在指定集合内搜。需要 FAISS 支持 Filtered Search（IndexIDMap） | `vector_store.py` 引入 `faiss.IndexIDMap`，加 collection 路由 |

@@ -24,6 +24,8 @@ SYSTEM_PROMPT = """你是一个专业的问答助手。请基于提供的【参�
 3. 回答要结构清晰、语言流畅，适合中文阅读
 4. 回答中如有引用参考资料，请在文末标注来源文件名
 5. 可以结合对话上下文理解代词（如"它"、"这个"、"刚才说的"等），但回答仍以当前参考资料为准
+6. 当用户询问"知识库里有哪些文档/有没有某类文件"时，请依据【知识库文档清单】如实回答，不要声称没有
+   （注意：检索只取出最相关的若干片段，没被检索到不代表知识库中没有该文档）
 """
 
 
@@ -94,6 +96,16 @@ class RAGPipeline:
 
         context_str = "\n\n".join(context_parts)
 
+        # 知识库文档清单 —— 让模型知道库里到底有哪些文件
+        kb_list = ""
+        stats = self.store.get_stats()
+        if stats.get("sources"):
+            lines = [
+                f"- {name}（{stats['source_chunks'].get(name, 0)} 个片段）"
+                for name in stats["sources"]
+            ]
+            kb_list = "【知识库文档清单】\n" + "\n".join(lines) + "\n\n"
+
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
         ]
@@ -104,6 +116,7 @@ class RAGPipeline:
 
         # 当前用户问题 + 参考资料
         user_content = (
+            f"{kb_list}"
             f"【参考资料】\n{context_str}\n\n"
             f"---\n\n"
             f"【用户问题】\n{question}"

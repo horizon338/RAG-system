@@ -22,9 +22,37 @@ def _load_pdf(file_path: Path) -> List[Document]:
 
 
 def _load_docx(file_path: Path) -> List[Document]:
+    """
+    解析 DOCX：按文档原顺序提取段落与表格
+    —— 只读 doc.paragraphs 会漏掉全部表格内容
+    """
     from docx import Document as DocxDoc
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
     doc = DocxDoc(str(file_path))
-    text = "\n".join(p.text for p in doc.paragraphs)
+    parts: List[str] = []
+
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            text = Paragraph(child, doc).text.strip()
+            if text:
+                parts.append(text)
+        elif child.tag == qn("w:tbl"):
+            table = Table(child, doc)
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                # 合并单元格会重复文本，去重保序
+                seen, uniq = set(), []
+                for c in cells:
+                    if c and c not in seen:
+                        seen.add(c)
+                        uniq.append(c)
+                if uniq:
+                    parts.append(" | ".join(uniq))
+
+    text = "\n".join(parts)
     return [Document(page_content=text, metadata={})]
 
 

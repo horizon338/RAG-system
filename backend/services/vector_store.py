@@ -4,7 +4,10 @@ FAISS 向量存储封装
 - 持久化到磁盘，启动时自动加载
 """
 import json
+import math
 import pickle
+import re
+from collections import Counter
 from pathlib import Path
 from typing import List, Tuple
 
@@ -14,6 +17,24 @@ import numpy as np
 from backend.config import FAISS_DIR
 from .embedding import get_embeddings, embed_query
 from .text_splitter import Document
+
+
+_WORD_RE = re.compile(r"[a-zA-Z0-9_]+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _tokenize(text: str) -> List[str]:
+    """
+    轻量分词：
+    - 英文/数字按连续串切分
+    - 中文取单字 + 相邻双字（bigram），兼顾精确与召回
+    """
+    text = text.lower()
+    tokens = _WORD_RE.findall(text)
+    cjk = _CJK_RE.findall(text)
+    tokens.extend(cjk)
+    tokens.extend(a + b for a, b in zip(cjk, cjk[1:]))
+    return tokens
 
 
 class VectorStore:
@@ -130,25 +151,86 @@ class VectorStore:
         return len(docs)
 
     # ---------- 检索 ----------
+    def _vector_ranking(self, query: str, limit: int) -> List[Tuple[int, float]]:
+        """向量检索，返回 [(doc_index, 余弦相似度), ...] 按分数降序"""
+        q_vec = np.array([embed_query(query)], dtype=np.float32)
+        faiss.normalize_L2(q_vec)
+        k = min(limit, len(self.documents))
+        scores, indices = self.index.search(q_vec, k)
+        out: List[Tuple[int, float]] = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0 or idx >= len(self.documents):
+                continue
+            out.append((int(idx), float(score)))
+        return out
+
+    def _keyword_ranking(self, query: str) -> List[Tuple[int, float]]:
+        """
+        BM25 关键词检索
+        —— 兜底 Embedding 质量差时，靠字面匹配把相关分块抬上来
+        """
+        q_tokens = _tokenize(query)
+        if not q_tokens:
+            return []
+
+        doc_tokens = [_tokenize(d.page_content) for d in self.documents]
+        n_docs = len(doc_tokens)
+        avgdl = sum(len(t) for t in doc_tokens) / n_docs or 1.0
+
+        # 文档频率
+        df: Counter = Counter()
+        for tokens in doc_tokens:
+            for t in set(tokens):
+                df[t] += 1
+
+        k1, b = 1.5, 0.75
+        scored: List[Tuple[int, float]] = []
+        for i, tokens in enumerate(doc_tokens):
+            tf = Counter(tokens)
+            s = 0.0
+            for t in q_tokens:
+                if t not in tf:
+                    continue
+                idf = math.log(1 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
+                s += idf * (tf[t] * (k1 + 1)) / (
+                    tf[t] + k1 * (1 - b + b * len(tokens) / avgdl)
+                )
+            if s > 0:
+                scored.append((i, s))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
     def search(self, query: str, top_k: int = 4) -> List[Tuple[Document, float]]:
         """
-        语义检索，返回 [(Document, 相似度), ...]
+        混合检索：向量相似度 + BM25 关键词分数加权融合
+        - 向量：使用真实余弦相似度（不归一化，避免噪声被放大）
+        - 关键词：BM25 按本次查询最高分归一
+        - 权重 向量 0.4 / 关键词 0.6（通用 Embedding 降级时关键词更可靠）
+        返回 [(Document, 综合相关度 0~1), ...]
         """
         if self.index is None or not self.documents:
             return []
 
-        q_vec = np.array([embed_query(query)], dtype=np.float32)
-        faiss.normalize_L2(q_vec)
+        vec_hits = self._vector_ranking(query, limit=max(top_k * 5, 20))
+        kw_hits = self._keyword_ranking(query)
 
-        k = min(top_k, len(self.documents))
-        scores, indices = self.index.search(q_vec, k)
+        if not vec_hits and not kw_hits:
+            return []
 
-        results: List[Tuple[Document, float]] = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0 or idx >= len(self.documents):
-                continue
-            results.append((self.documents[idx], float(score)))
-        return results
+        vec_map = {idx: max(cos, 0.0) for idx, cos in vec_hits}
+        kw_map = dict(kw_hits)
+        kw_max = kw_hits[0][1] if kw_hits else 0.0
+
+        W_VEC, W_KW = 0.4, 0.6
+        fused: dict[int, float] = {}
+        for idx in set(vec_map) | set(kw_map):
+            cos = vec_map.get(idx, 0.0)
+            kw = (kw_map.get(idx, 0.0) / kw_max) if kw_max > 0 else 0.0
+            fused[idx] = W_VEC * cos + W_KW * kw
+
+        ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return [(self.documents[idx], round(score, 4)) for idx, score in ranked]
 
     # ---------- 状态查询 ----------
     @property
@@ -161,15 +243,17 @@ class VectorStore:
 
     def get_stats(self) -> dict:
         """返回知识库统计信息"""
-        sources = set()
+        source_chunks: Counter = Counter()
         for d in self.documents:
-            if "source" in d.metadata:
-                sources.add(d.metadata["source"])
+            src = d.metadata.get("source")
+            if src:
+                source_chunks[src] += 1
         return {
-            "documents": len(sources),
+            "documents": len(source_chunks),
             "chunks": len(self.documents),
             "ready": self.is_ready,
-            "sources": sorted(sources),
+            "sources": sorted(source_chunks.keys()),
+            "source_chunks": dict(source_chunks),
         }
 
 
