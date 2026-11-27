@@ -1,28 +1,52 @@
 @echo off
 chcp 65001 >nul
-REM ===== RAG 问答系统 一键启动 =====
+setlocal
+title RAG QA System Launcher
 echo ============================================
-echo    RAG 问答系统 - 启动中...
+echo    RAG QA System - starting...
 echo ============================================
 echo.
 
 cd /d "%~dp0"
 
-REM 启动后端
-echo [1/2] 启动后端 FastAPI (端口 8000) ...
-start "RAG-Backend" cmd /k "cd /d %cd% && python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+REM ===== 1. check python =====
+python --version >nul 2>&1
+if errorlevel 1 goto NOPYTHON
+
+REM ===== 2. check frontend deps =====
+if exist "%~dp0frontend\node_modules" goto SKIPINSTALL
+echo [INFO] frontend node_modules not found, running npm install ...
+pushd "%~dp0frontend"
+call npm.cmd install
+popd
+echo.
+:SKIPINSTALL
+
+REM ===== 3. start backend =====
+echo [1/2] starting backend FastAPI on port 8000 ...
+start "RAG-Backend" /d "%~dp0" cmd /k "python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"
 
 timeout /t 3 /nobreak >nul
 
-REM 启动前端
-echo [2/2] 启动前端 Vue (端口 5173) ...
-cd frontend
-start "RAG-Frontend" cmd /k "cd /d %cd% && npm.cmd run dev"
+REM ===== 4. start frontend =====
+echo [2/2] starting frontend Vite on port 5173 ...
+start "RAG-Frontend" /d "%~dp0frontend" cmd /k "npm.cmd run dev"
 
 echo.
-echo ✅ 启动完成！
-echo    后端 API:  http://localhost:8000  (API 文档: /docs)
-echo    前端界面:  http://localhost:5173
+echo Done.
+echo    Backend API   : http://localhost:8000
+echo    API docs      : http://localhost:8000/docs
+echo    Frontend UI   : http://localhost:5173
 echo.
-echo 按任意键退出此窗口（后端前端继续运行）...
+echo Open http://localhost:5173 in your browser after a few seconds.
+echo Press any key to close this window (backend / frontend keep running).
 pause >nul
+exit /b 0
+
+:NOPYTHON
+echo [ERROR] python not found in PATH.
+echo         Install Python and check "Add Python to PATH", then retry.
+echo.
+echo Press any key to exit...
+pause >nul
+exit /b 1
